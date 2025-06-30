@@ -227,7 +227,7 @@ class Trader:
             }
         else:
             # Live data not yet available, return placeholder or indicate loading
-            return {"account_id": "Fetching...", "balance": None, "equity": None, "margin": None, "currency": None}
+            return {"account_id": "Fetching...", "balance": 0.0, "equity": 0.0, "margin": 0.0, "currency": "USD"}
 
     def _send_account_data_request(self):
         if not USE_QUICKFIX or not self.is_connected:
