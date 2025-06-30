@@ -22,6 +22,14 @@ class Trader:
         self._last_error = ""
         self.price_history: List[float] = []
         self.history_size = history_size
+
+        # Attributes for live account data
+        self.account_id: str | None = None
+        self.balance: float | None = None
+        self.equity: float | None = None
+        self.margin: float | None = None
+        self.currency: str | None = None # Account currency
+
         if USE_QUICKFIX:
             self.application = None
             self.store_factory = None
@@ -202,11 +210,63 @@ class Trader:
 
     def get_account_summary(self) -> dict:
         if not self.is_connected:
-            raise RuntimeError("Not connected")
-        if not USE_QUICKFIX:
-            return {"account_id": "MOCK123", "balance": 10000.0, "equity": 9950.0, "margin": 50.0}
-        # TODO: implement real FIX AccountSummaryRequest/Response
-        return {"account_id": "...", "balance": 0.0, "equity": 0.0, "margin": 0.0}
+            # If not connected via FIX, or if FIX is not used at all.
+            if not USE_QUICKFIX:
+                return {"account_id": "MOCK123", "balance": 10000.0, "equity": 9950.0, "margin": 50.0, "currency": "USD"}
+            else: # Using QuickFIX but not connected
+                raise RuntimeError("Not connected to FIX server.")
+
+        # If USE_QUICKFIX is True and connected:
+        if self.account_id is not None: # Check if live data has been populated
+            return {
+                "account_id": self.account_id,
+                "balance": self.balance,
+                "equity": self.equity,
+                "margin": self.margin,
+                "currency": self.currency
+            }
+        else:
+            # Live data not yet available, return placeholder or indicate loading
+            return {"account_id": "Fetching...", "balance": 0.0, "equity": 0.0, "margin": 0.0, "currency": "USD"}
+
+    def _send_account_data_request(self):
+        if not USE_QUICKFIX or not self.is_connected:
+            return
+
+        print("Attempting to send Account Data Request...")
+        try:
+            # This is a speculative implementation. cTrader might use a different message
+            # or mechanism (e.g., account data pushed automatically after logon).
+            # Common custom message for this: UserDefined ('UAR') + AccountDataRequestType (2630)
+            # For now, we'll simulate creating such a message.
+            # The actual MsgType and fields will depend on cTrader's FIX specification.
+
+            msg = fix.Message()
+            header = msg.getHeader()
+            # Placeholder: Assuming 'UAR' is the MsgType for AccountDataRequest.
+            # This needs to be verified against cTrader's documentation.
+            header.setField(fix.MsgType("UAR")) # CUSTOM_TAG: Replace 'UAR' if different
+
+            # Generate a unique request ID
+            req_id = f"ADR_{int(time.time()*1000)}"
+            msg.setField(fix.AccountDataRequestID(req_id)) # CUSTOM_TAG: AccountDataRequestID (e.g., 2629) - placeholder tag
+
+            # Request Type: 4 = Request Summary Account Balances
+            # CUSTOM_TAG: AccountDataRequestType (e.g., 2630) - placeholder tag
+            msg.setField(fix.AccountDataRequestType(4))
+
+            # Optionally, specify Account if known and needed for the request
+            # if self.settings.trade_fix.sender_comp_id: # Or a specific account number if available
+            #    msg.setField(fix.Account(self.settings.trade_fix.sender_comp_id))
+
+            for sid in fix.Session.getSessions():
+                print(f"Sending AccountDataRequest ({req_id}) on session {sid}")
+                fix.Session.sendToTarget(msg, sid)
+        except AttributeError as e:
+            print(f"Error creating AccountDataRequest: QuickFIX attribute not found (likely a custom tag not defined): {e}")
+            print("This suggests the custom FIX dictionary for cTrader is not fully integrated or tags are incorrect.")
+        except Exception as e:
+            print(f"Error sending AccountDataRequest: {e}")
 
     def get_market_price(self, symbol: str) -> float:
         if not self.is_connected:
@@ -272,6 +332,9 @@ if USE_QUICKFIX:
             self.trader._last_error = ""
             self.trader._logon_event.set() # Signal that logon has occurred
             self.trader._logout_event.clear() # Ensure logout event is not set
+
+            # After successful logon, request account data
+            self.trader._send_account_data_request()
 
         def onLogout(self, sessionID):
             print(f"Logout: {sessionID}")
@@ -357,4 +420,69 @@ if USE_QUICKFIX:
                 # - Update order status based on ExecType and OrdStatus.
                 # - Handle fills, partial fills, cancels, rejects.
                 # - Potentially update self.trader._last_error if it's a rejection of an order.
+
+            # Speculative: Handling AccountReport (custom message type 'UAS')
+            # This assumes cTrader sends a message like 'UAS' in response to 'UAR'.
+            # All tags used here are placeholders and need verification from cTrader's FIX spec.
+            elif msg_type_value == "UAS": # CUSTOM_TAG: Replace 'UAS' if different
+                print(f"Received AccountReport (UAS): {message}")
+                try:
+                    account_field = fix.Account() # Standard tag 1
+                    # Placeholder tags for balance, equity, margin, currency.
+                    # These are highly likely to be custom tags in the 5000+ or 9000+ range.
+                    # For example purposes, I'm inventing field objects.
+                    # These will cause AttributeErrors if not defined in the FIX dictionary.
+                    balance_field = fix.Balance() # Standard tag 900 (often for CashBalance in other contexts, may not be it)
+                                                # More likely custom e.g., fix.XBalance (tag 9001)
+                    equity_field = fix.NetChgPrevDay() # Placeholder: fix.XEquity (tag 9002) - No standard equity tag like this
+                    margin_field = fix.MarginRatio()   # Placeholder: fix.XMargin (tag 9003) - No standard margin tag like this
+                    currency_field = fix.Currency() # Standard tag 15
+
+                    if message.isSetField(account_field.getField()):
+                        message.getField(account_field)
+                        self.trader.account_id = account_field.getValue()
+                        print(f"  Account ID: {self.trader.account_id}")
+
+                    # --- IMPORTANT: The following field extractions are highly speculative ---
+                    # --- and will likely fail without the correct cTrader FIX Dictionary ---
+                    # --- and tag numbers. These are illustrative.                      ---
+
+                    # Example: Balance (assuming custom tag 9001 for XBalance)
+                    # Realistically, you'd use fix.StringField(9001) or similar if the tag is custom
+                    # and not pre-defined in the base quickfix python objects.
+                    # For now, to avoid immediate error IF the dictionary has 'Balance' but it's wrong:
+                    if hasattr(fix, 'XBalance') and message.isSetField(fix.XBalance().getField()): # CUSTOM_TAG: XBalance (e.g. 9001)
+                        message.getField(fix.XBalance()) # This line would be fix.XBalance()
+                        self.trader.balance = float(fix.XBalance().getValue()) # And here
+                        print(f"  Balance: {self.trader.balance}")
+                    elif message.isSetField(balance_field.getField()): # Fallback to trying standard Balance tag if XBalance not there
+                         message.getField(balance_field)
+                         try:
+                            self.trader.balance = float(balance_field.getValue())
+                            print(f"  Balance (using standard Balance tag): {self.trader.balance}")
+                         except ValueError:
+                            print(f"  Could not parse balance from standard Balance tag: {balance_field.getValue()}")
+
+
+                    if hasattr(fix, 'XEquity') and message.isSetField(fix.XEquity().getField()): # CUSTOM_TAG: XEquity (e.g. 9002)
+                        message.getField(fix.XEquity())
+                        self.trader.equity = float(fix.XEquity().getValue())
+                        print(f"  Equity: {self.trader.equity}")
+
+                    if hasattr(fix, 'XMargin') and message.isSetField(fix.XMargin().getField()): # CUSTOM_TAG: XMargin (e.g. 9003)
+                        message.getField(fix.XMargin())
+                        self.trader.margin = float(fix.XMargin().getValue())
+                        print(f"  Margin: {self.trader.margin}")
+
+                    if message.isSetField(currency_field.getField()):
+                        message.getField(currency_field)
+                        self.trader.currency = currency_field.getValue()
+                        print(f"  Currency: {self.trader.currency}")
+
+                    print("Trader account data updated.")
+
+                except AttributeError as e:
+                    print(f"Error processing AccountReport (UAS): Attribute not found (custom tag missing from dictionary?): {e}")
+                except Exception as e:
+                    print(f"Error processing AccountReport (UAS): {e}")
             pass
