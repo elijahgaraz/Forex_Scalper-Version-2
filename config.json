@@ -1,0 +1,16 @@
+{
+  "trade_fix": {
+  "host": "live-uk-eqx-01.p.c-trader.com",
+  "port": 5212,
+  "sender_comp_id": "live4.icmarkets.6077021",
+  "target_comp_id": "cServer",
+  "password": "@Shamika00@"
+  },
+  "quote_fix": {
+  "port": 5211,
+  "config_path": "quickfix.cfg",
+  "password": "(@Shamika00@)"
+  }
+  }
+  
+  

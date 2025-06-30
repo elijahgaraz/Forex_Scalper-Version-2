@@ -1,0 +1,4 @@
+# Requirements for the forex_scalper application
+#
+# The application currently only uses Python's standard library modules
+# (including tkinter for the GUI). No third-party packages are needed.
