@@ -1,23 +1,28 @@
 import threading
 import random
 import time
-import os # Added for path operations
-from typing import List
+import os # For potential future use, e.g. loading certs for WSS
+import json # For JSON message construction and parsing
+from typing import List, Dict, Any, Optional
 
-# Try to import QuickFIX and verify necessary classes, otherwise fallback to stubs
+import requests # For OAuth authentication
+import websockets # For WebSocket communication
+# from .settings import OpenAPISettings # Assuming settings.py is in the same directory or package
+
+# This flag will determine if we attempt to use the Open API or run in mock mode.
+# It can be set based on availability of libraries or configuration.
+USE_OPENAPI = True
 try:
-    import quickfix as fix
-    # Check for necessary FIX classes
-    if not hasattr(fix, 'SessionSettings') or not hasattr(fix, 'SocketInitiator') or not hasattr(fix, 'Application'):
-        raise ImportError("QuickFIX installation missing required classes")
-    USE_QUICKFIX = True
+    import websockets
+    import requests
 except ImportError:
-    USE_QUICKFIX = False
-    print("QuickFIX not available or incomplete: running in stub mode. Install python-quickfix correctly for live FIX connectivity.")
+    USE_OPENAPI = False
+    print("OpenAPI libraries (websockets, requests) not available: running in stub mode.")
+
 
 class Trader:
-    def __init__(self, settings, history_size: int = 100):
-        self.settings = settings
+    def __init__(self, settings, history_size: int = 100): # settings will be an instance of Settings class
+        self.settings = settings # This should contain an openapi attribute of type OpenAPISettings
         self.is_connected = False
         self._last_error = ""
         self.price_history: List[float] = []
@@ -30,194 +35,320 @@ class Trader:
         self.margin: float | None = None
         self.currency: str | None = None # Account currency
 
-        if USE_QUICKFIX:
-            self.application = None
-            self.store_factory = None
-            self.log_factory = None
-            self.settings_file = None
-            self.initiator = None
-            self._logon_event = threading.Event()
-            self._logout_event = threading.Event()
+        # Attributes for Open API
+        self._access_token: Optional[str] = None
+        self._refresh_token: Optional[str] = None
+        self._token_expiry_time: Optional[float] = None
+        self._ws_client: Optional[websockets.WebSocketClientProtocol] = None
+        self._ws_listener_thread: Optional[threading.Thread] = None
+        self._message_id_counter: int = 1 # For uniquely identifying client messages
 
-    def connect(self) -> bool:
-        if not USE_QUICKFIX:
-            self.is_connected = True
-            return True
+    def _next_message_id(self) -> str:
+        # Generates a unique client message ID for requests
+        msg_id = str(self._message_id_counter)
+        self._message_id_counter += 1
+        return msg_id
+
+    def _authenticate_openapi(self) -> bool: # Made synchronous
+        """
+        Authenticates with cTrader Open API using OAuth 2.0 (Client Credentials Grant).
+        Stores the access token and refresh token.
+        This method is synchronous as it uses the 'requests' library.
+        """
+        if not self.settings.openapi.client_id or not self.settings.openapi.client_secret:
+            self._last_error = "OpenAPI Client ID or Secret not configured."
+            print(self._last_error)
+            return False
+
+        if not self.settings.openapi.token_url:
+            self._last_error = "OpenAPI Token URL not configured."
+            print(self._last_error)
+            return False
+
+        payload = {
+            'grant_type': 'client_credentials',
+            'client_id': self.settings.openapi.client_id,
+            'client_secret': self.settings.openapi.client_secret,
+        }
+
         try:
-            # Ensure fix_config_path from settings is used.
-            # The settings object is self.settings.quote_fix for quote connection related settings
-            fix_config_file_path = self.settings.quote_fix.config_path
-            if not os.path.exists(fix_config_file_path):
-                self._last_error = f"FIX configuration file not found: {fix_config_file_path}"
+            print(f"Attempting OAuth to {self.settings.openapi.token_url}")
+            response = requests.post(self.settings.openapi.token_url, data=payload)
+            response.raise_for_status()
+
+            token_data = response.json()
+            self._access_token = token_data.get('access_token')
+            self._refresh_token = token_data.get('refresh_token')
+            expires_in = token_data.get('expires_in')
+
+            if not self._access_token:
+                self._last_error = "Failed to get access token from OAuth response."
                 print(self._last_error)
                 return False
 
-            self.settings_file = fix.SessionSettings(fix_config_file_path)
+            if expires_in:
+                self._token_expiry_time = time.time() + int(expires_in) - 60
 
-            # Override password if provided in settings (from env var)
-            if self.settings.quote_fix.password:
-                # Iterate over all session IDs in the settings file
-                sids = self.settings_file.getSessions()
-                for sid in sids:
-                    session_dict = self.settings_file.get(sid)
-                    session_dict.setString("Password", self.settings.quote_fix.password)
-                    # Potentially remove if it was an empty string from file?
-                    # Or QuickFIX handles empty Password field appropriately if not set.
-                print("Overridden FIX Password from settings/environment variable.")
+            print("Successfully obtained OpenAPI access token.")
+            self.settings.openapi.access_token = self._access_token
+            self.settings.openapi.refresh_token = self._refresh_token
+            self.settings.openapi.token_expiry_time = self._token_expiry_time
+            return True
 
-            # Check for DataDictionary, FileStorePath, FileLogPath
-            # These paths are typically relative to where the application is run,
-            # or absolute if specified in quickfix.cfg.
-            # QuickFIX itself will error if these are problematic, but early checks can be useful.
+        except requests.exceptions.RequestException as e:
+            self._last_error = f"OAuth request failed: {e}"
+            if hasattr(e, 'response') and e.response is not None:
+                 try:
+                    self._last_error += f" - Server response: {e.response.json()}"
+                 except json.JSONDecodeError:
+                    self._last_error += f" - Server response: {e.response.text}"
+            print(self._last_error)
+            return False
+        except Exception as e: # Catch any other exceptions during auth
+            self._last_error = f"Error during OpenAPI authentication: {e}"
+            print(self._last_error)
+            return False
 
-            default_settings = self.settings_file.get() # Get default settings section
+    async def _ws_connect_and_authorize(self) -> bool:
+        """Establishes WebSocket connection and sends initial authorization."""
+        if not self._access_token:
+            self._last_error = "Cannot connect WebSocket without access token."
+            print(self._last_error)
+            return False
 
-            data_dictionary_path = default_settings.getString("DataDictionary")
-            if data_dictionary_path and not os.path.exists(data_dictionary_path):
-                 # Try to resolve relative to config file path
-                if not os.path.isabs(data_dictionary_path):
-                    config_dir = os.path.dirname(os.path.abspath(fix_config_file_path))
-                    potential_path = os.path.join(config_dir, data_dictionary_path)
-                    if os.path.exists(potential_path):
-                         # If found, QuickFIX might need it to be relative or absolute depending on its CWD.
-                         # For now, just warning. A better fix would be to make path absolute for QuickFIX.
-                         print(f"Warning: DataDictionary '{data_dictionary_path}' found relative to config file at '{potential_path}'. Ensure QuickFIX CWD is correct or use absolute paths in config.")
-                    else:
-                        self._last_error = f"DataDictionary file '{data_dictionary_path}' (from quickfix.cfg) not found."
-                        print(self._last_error)
-                        # return False # This can be a critical error.
+        if not self.settings.openapi.api_ws_url:
+            self._last_error = "OpenAPI WebSocket URL not configured."
+            print(self._last_error)
+            return False
 
-            for path_key in ["FileStorePath", "FileLogPath"]:
-                path_value = default_settings.getString(path_key)
-                if path_value:
-                    # If path is relative, it's relative to CWD QuickFIX runs in.
-                    # Create if it doesn't exist.
-                    if not os.path.isabs(path_value) and not os.path.exists(path_value):
-                        try:
-                            os.makedirs(path_value, exist_ok=True)
-                            print(f"Created directory for {path_key}: {path_value}")
-                        except Exception as e:
-                            self._last_error = f"Failed to create directory for {path_key} at '{path_value}': {e}"
-                            print(self._last_error)
-                            # return False # This can be a critical error.
-                else:
-                    print(f"Warning: {path_key} is not defined in quickfix.cfg [DEFAULT] section.")
+        try:
+            print(f"Connecting to WebSocket: {self.settings.openapi.api_ws_url}")
+            # Note: websockets.connect() is an async context manager in typical use
+            # For a long-lived client in a class, we manage connection manually.
+            self._ws_client = await websockets.connect(self.settings.openapi.api_ws_url)
+            print("WebSocket connection established.")
 
+            # Send Application Authorization Request
+            # Structure from cTrader Open API documentation (ProtoOAApplicationAuthReq)
+            auth_request_payload = {
+                "payloadType": 1, # ProtoOAApplicationAuthReq
+                "payload": {
+                    "clientId": self.settings.openapi.client_id,
+                    "clientSecret": self.settings.openapi.client_secret
+                }
+            }
+            await self._ws_client.send(json.dumps(auth_request_payload))
+            print("Sent Application Authorization Request.")
 
-            self.application = Application(self)
-            self.store_factory = fix.FileStoreFactory(self.settings_file)
-            self.log_factory = fix.FileLogFactory(self.settings_file)
+            # Wait for ProtoOAApplicationAuthRes
+            response_str = await self._ws_client.recv()
+            response_json = json.loads(response_str)
+            print(f"Received App Auth Response: {response_json}")
 
-            # Ensure logon and logout events are reset before attempting to connect
-            self._logon_event.clear()
-            self._logout_event.clear()
-
-            self.initiator = fix.SocketInitiator(
-                self.application,
-                self.store_factory,
-                self.settings_file,
-                self.log_factory
-            )
-            self.initiator.start()
-
-            # Wait for logon event to be set by onLogon callback, with a timeout
-            # The timeout value (e.g., 10 seconds) should be configurable or generous
-            logon_success = self._logon_event.wait(timeout=10.0)
-
-            if logon_success:
-                self.is_connected = True
-                self._last_error = ""
-                print("FIX session successfully logged on.")
+            if response_json.get("payloadType") == 2: # ProtoOAApplicationAuthRes
+                # Potentially check response details here for success
+                print("Application authorized on WebSocket.")
+                # Next, authorize account if a default one is set
+                if self.settings.openapi.default_account_id_str:
+                    # This is also a cTrader specific Proto Message, e.g. ProtoOAAccountAuthReq
+                    # For now, assume app auth is enough to start receiving some messages
+                    # or that account auth happens as part of other requests (e.g. subscribe to symbols)
+                    pass
                 return True
             else:
-                # If logon event timed out, check if logout event was triggered (e.g. immediate disconnect)
-                if self._logout_event.is_set():
-                    # _last_error might have been set in onLogout or by other means
-                    if not self._last_error:
-                         self._last_error = "Logout occurred during connection attempt."
-                else:
-                    self._last_error = "Logon attempt timed out."
-
-                print(f"FIX Logon failed: {self._last_error}")
-                # Attempt to stop the initiator if it started but didn't log on
-                if self.initiator:
-                    self.initiator.stop()
-                self.is_connected = False
+                self._last_error = f"Unexpected response to App Auth: {response_json}"
+                print(self._last_error)
+                await self._ws_client.close()
+                self._ws_client = None
                 return False
 
-        except fix.ConfigError as e:
-            self.is_connected = False
-            self._last_error = f"FIX Configuration Error: {e}"
+        except websockets.exceptions.WebSocketException as e:
+            self._last_error = f"WebSocket connection/authorization error: {e}"
             print(self._last_error)
+            if self._ws_client:
+                await self._ws_client.close()
+            self._ws_client = None
             return False
         except Exception as e:
-            self.is_connected = False
-            self._last_error = f"FIX Connection Error: {str(e)}"
+            self._last_error = f"General error during WebSocket connect/auth: {e}"
             print(self._last_error)
-            # Ensure initiator is stopped if an exception occurs after it's created
-            if hasattr(self, 'initiator') and self.initiator:
-                try:
-                    self.initiator.stop()
-                except Exception as stop_e:
-                    print(f"Error stopping initiator: {stop_e}")
+            if self._ws_client and self._ws_client.open:
+                await self._ws_client.close()
+            self._ws_client = None
             return False
 
+
+    async def _listen_ws(self):
+        """Listens for incoming messages on the WebSocket."""
+        if not self._ws_client or not self._ws_client.open:
+            print("WebSocket listener cannot start: not connected.")
+            return
+
+        print("Starting WebSocket listener...")
+        try:
+            async for message_str in self._ws_client:
+                try:
+                    message_json = json.loads(message_str)
+                    print(f"WS RECV: {message_json}") # Basic logging of all messages
+
+                    payload_type = message_json.get("payloadType")
+                    payload = message_json.get("payload", {})
+                    client_msg_id = message_json.get("clientMsgId")
+
+                    # TODO: Dispatch based on payload_type
+                    if payload_type == 5: # ProtoHeartbeatEvent
+                        print("Received Heartbeat event from server.")
+                        # Respond with a heartbeat if required by API spec (often not needed for client)
+
+                    elif payload_type == 51: # ProtoOASymbolsListRes
+                        # Example: if we requested all symbols
+                        print(f"Received Symbols List Response for clientMsgId {client_msg_id}")
+                        # Process symbols...
+
+                    elif payload_type == 53: # ProtoOASpotEvent (price update)
+                        # Example structure, needs to match cTrader Open API spec
+                        # symbol_id = payload.get("symbolId")
+                        # bid_price = payload.get("bid")
+                        # ask_price = payload.get("ask")
+                        # if symbol_id and (bid_price or ask_price):
+                        #    avg_price = (bid_price + ask_price) / 2 if bid_price and ask_price else bid_price or ask_price
+                        #    # self.price_history logic here, map symbol_id to symbol string
+                        #    print(f"Price update for {symbol_id}: Bid={bid_price}, Ask={ask_price}")
+                        pass
+
+
+                    # Add more handlers for:
+                    # - Account authorization responses
+                    # - Account list responses
+                    # - Execution reports (ProtoOAExecutionEvent)
+                    # - Account balance updates (e.g. ProtoOATraderUpdatedEvent)
+
+                except json.JSONDecodeError:
+                    print(f"Error decoding JSON from WebSocket: {message_str}")
+                except Exception as e:
+                    print(f"Error processing WebSocket message: {e}")
+        except websockets.exceptions.ConnectionClosed:
+            print("WebSocket connection closed.")
+        except Exception as e:
+            print(f"WebSocket listener error: {e}")
+        finally:
+            self.is_connected = False
+            self._ws_client = None # Ensure it's None so connect can be called again
+            print("WebSocket listener stopped.")
+
+
+    def connect(self) -> bool:
+        """Connects to cTrader Open API: Authenticates and establishes WebSocket."""
+        if not USE_OPENAPI:
+            self._last_error = "OpenAPI libraries not installed."
+            # Fallback to mock connection for GUI if needed, or just return False
+            # For now, let's simulate a successful mock connection for structure
+            print("Running in mock mode for connect().")
+            self.is_connected = True # Mock connection
+            return True
+
+        import asyncio
+
+        # Run async authentication and connection logic
+        # This is simplified; in a real app, especially with Tkinter,
+        # you'd need to manage the asyncio event loop carefully,
+        # possibly running it in a separate thread.
+        try:
+            # Authenticate first (synchronous HTTP for token)
+            if not self._access_token or (self._token_expiry_time and time.time() >= self._token_expiry_time):
+                print("Access token missing or expired, re-authenticating...")
+                if not self._authenticate_openapi(): # Call synchronous method directly
+                     return False
+
+            # Connect WebSocket and authorize app (asynchronous)
+            if not self._ws_client or not self._ws_client.open:
+                if not asyncio.run(self._ws_connect_and_authorize()):
+                    return False
+
+            self.is_connected = True
+            self._last_error = ""
+
+            # Start the WebSocket listener thread
+            if self._ws_listener_thread is None or not self._ws_listener_thread.is_alive():
+                self._ws_listener_thread = threading.Thread(target=lambda: asyncio.run(self._listen_ws()), daemon=True)
+                self._ws_listener_thread.start()
+
+            print("Trader connected successfully via OpenAPI.")
+            return True
+
+        except Exception as e:
+            self._last_error = f"Failed to connect: {e}"
+            print(self._last_error)
+            self.is_connected = False
+            return False
+
+    def disconnect(self):
+        """Disconnects from WebSocket and cleans up."""
+        import asyncio
+        print("Disconnecting trader...")
+        if self._ws_client and self._ws_client.open:
+            asyncio.run(self._ws_client.close()) # Ensure loop is running to close
+        if self._ws_listener_thread and self._ws_listener_thread.is_alive():
+            self._ws_listener_thread.join(timeout=5) # Wait for listener to stop
+
+        self._ws_client = None
+        self.is_connected = False
+        self._access_token = None # Clear token on disconnect
+        self._refresh_token = None
+        self._token_expiry_time = None
+        self.settings.openapi.access_token = None # Also clear from settings
+        self.settings.openapi.refresh_token = None
+        self.settings.openapi.token_expiry_time = None
+        print("Trader disconnected.")
+
+
     def get_connection_status(self):
-        # Update connection status based on FIX session status if available
-        if USE_QUICKFIX and self.initiator:
-            try:
-                # This part is tricky because SocketInitiator itself doesn't directly expose isLoggedOn.
-                # We rely on onLogon/onLogout callbacks to set self.is_connected.
-                # However, we can check if any session is logged on as a fallback,
-                # though our primary mechanism is _logon_event and _logout_event.
-                any_session_logged_on = False
-                if fix.Session.getSessions(): # Check if there are any sessions
-                    for sid in fix.Session.getSessions():
-                        session = fix.Session.lookupSession(sid)
-                        if session and session.isLoggedOn():
-                            any_session_logged_on = True
-                            break
-                    # If our internal flag self.is_connected (driven by onLogon/onLogout callbacks)
-                    # disagrees with direct session state check, the callback-driven state is primary.
-                    # This block is more for deeper diagnostics if needed.
-                    # For example, if any_session_logged_on is true but self.is_connected is false,
-                    # it might indicate a missed onLogon or premature onLogout call.
-                    pass
-                else: # No sessions available (e.g., initiator not started or stopped)
-                    if self.is_connected: # If we thought we were connected (due to callbacks), but no sessions exist
-                        print("Warning: No FIX sessions found (initiator stopped or not started properly), but trader state indicated 'connected'. Updating status.")
-                        self.is_connected = False
-                        if not self._last_error: # If no specific error, set a generic one
-                           self._last_error = "No active FIX sessions."
-
-            except Exception as e:
-                print(f"Error checking session status: {e}")
-                # Potentially set is_connected to False if we can't verify
-                # self.is_connected = False
-                # self._last_error = f"Error checking session status: {e}"
-                pass # Keep current is_connected state if check fails for now
-
         return self.is_connected, self._last_error
 
     def start_heartbeat(self):
-        def hb():
-            while self.is_connected:
-                if USE_QUICKFIX:
-                    for sid in fix.Session.getSessions():
-                        fix.Session.sendToTarget(fix.Heartbeat(), sid)
-                time.sleep(30)
-        threading.Thread(target=hb, daemon=True).start()
+        # For WebSocket, server typically sends heartbeats (e.g. ProtoHeartbeatEvent).
+        # Client might need to send PING frames or specific heartbeat messages if API requires.
+        # cTrader Open API: client sends ProtoPingReq, server responds ProtoPingRes.
+        # This should be handled in the _listen_ws loop or a separate timed task.
+
+        async def send_ping_periodically():
+            while self.is_connected and self._ws_client and self._ws_client.open:
+                try:
+                    ping_req_payload = {
+                        "payloadType": 3, # ProtoPingReq
+                        "payload": {"timestamp": int(time.time() * 1000)}
+                    }
+                    print("Sending Ping Request to server...")
+                    await self._ws_client.send(json.dumps(ping_req_payload))
+                    await asyncio.sleep(30) # Send ping every 30 seconds
+                except websockets.exceptions.ConnectionClosed:
+                    print("Cannot send ping, connection closed.")
+                    break
+                except Exception as e:
+                    print(f"Error sending ping: {e}")
+                    break # Stop pinging on error
+
+        if USE_OPENAPI and self.is_connected:
+            # Run this in the asyncio event loop managed by the listener thread,
+            # or create a new task if running asyncio more globally.
+            # For simplicity, if _listen_ws is running, it can manage this.
+            # This is a simplified way; proper task management in asyncio is better.
+            # Let's assume for now the main listener might handle incoming heartbeats
+            # and we'll add outgoing ping sending if explicitly required.
+            # The example above is how one might send it.
+            print("Heartbeat/Ping mechanism for OpenAPI to be implemented if server doesn't auto-disconnect inactive clients or if required by spec.")
+            pass
+
 
     def get_account_summary(self) -> dict:
-        if not self.is_connected:
-            # If not connected via FIX, or if FIX is not used at all.
-            if not USE_QUICKFIX:
-                return {"account_id": "MOCK123", "balance": 10000.0, "equity": 9950.0, "margin": 50.0, "currency": "USD"}
-            else: # Using QuickFIX but not connected
-                raise RuntimeError("Not connected to FIX server.")
+        if not USE_OPENAPI: # If library import failed
+             return {"account_id": "MOCK_API_DISABLED", "balance": 0.0, "equity": 0.0, "margin": 0.0, "currency": "N/A"}
 
-        # If USE_QUICKFIX is True and connected:
-        if self.account_id is not None: # Check if live data has been populated
+        if not self.is_connected:
+            raise RuntimeError("Not connected to cTrader Open API.")
+
+        # If live data has been populated by WebSocket listener
+        if self.account_id is not None:
             return {
                 "account_id": self.account_id,
                 "balance": self.balance,
@@ -226,263 +357,101 @@ class Trader:
                 "currency": self.currency
             }
         else:
-            # Live data not yet available, return placeholder or indicate loading
-            return {"account_id": "Fetching...", "balance": 0.0, "equity": 0.0, "margin": 0.0, "currency": "USD"}
+            # TODO: Send a request for account summary if not yet populated
+            # For now, return placeholder
+            # self._request_account_summary_openapi() # This should be async or queued
+            print("Account summary not yet populated from API.")
+            return {"account_id": "Fetching...", "balance": None, "equity": None, "margin": None, "currency": None}
 
-    def _send_account_data_request(self):
-        if not USE_QUICKFIX or not self.is_connected:
-            return
+    # Placeholder for _request_account_summary_openapi
+    async def _request_account_summary_openapi(self):
+        if self.is_connected and self._ws_client:
+            # Example: Request ProtoOAGetAccountListReq
+            # This would involve knowing your cTrader Account ID (ctidTraderAccountId)
+            # which you might get after authorizing the account.
+            # This is a placeholder for the actual request.
+            # account_list_req = {
+            #    "payloadType": XYZ, # ProtoOAGetAccountListReq
+            #    "clientMsgId": self._next_message_id()
+            # }
+            # await self._ws_client.send(json.dumps(account_list_req))
+            print("Placeholder: _request_account_summary_openapi called.")
+            pass
 
-        print("Attempting to send Account Data Request...")
-        try:
-            # This is a speculative implementation. cTrader might use a different message
-            # or mechanism (e.g., account data pushed automatically after logon).
-            # Common custom message for this: UserDefined ('UAR') + AccountDataRequestType (2630)
-            # For now, we'll simulate creating such a message.
-            # The actual MsgType and fields will depend on cTrader's FIX specification.
-
-            msg = fix.Message()
-            header = msg.getHeader()
-            # Placeholder: Assuming 'UAR' is the MsgType for AccountDataRequest.
-            # This needs to be verified against cTrader's documentation.
-            header.setField(fix.MsgType("UAR")) # CUSTOM_TAG: Replace 'UAR' if different
-
-            # Generate a unique request ID
-            req_id = f"ADR_{int(time.time()*1000)}"
-            msg.setField(fix.AccountDataRequestID(req_id)) # CUSTOM_TAG: AccountDataRequestID (e.g., 2629) - placeholder tag
-
-            # Request Type: 4 = Request Summary Account Balances
-            # CUSTOM_TAG: AccountDataRequestType (e.g., 2630) - placeholder tag
-            msg.setField(fix.AccountDataRequestType(4))
-
-            # Optionally, specify Account if known and needed for the request
-            # if self.settings.trade_fix.sender_comp_id: # Or a specific account number if available
-            #    msg.setField(fix.Account(self.settings.trade_fix.sender_comp_id))
-
-            for sid in fix.Session.getSessions():
-                print(f"Sending AccountDataRequest ({req_id}) on session {sid}")
-                fix.Session.sendToTarget(msg, sid)
-        except AttributeError as e:
-            print(f"Error creating AccountDataRequest: QuickFIX attribute not found (likely a custom tag not defined): {e}")
-            print("This suggests the custom FIX dictionary for cTrader is not fully integrated or tags are incorrect.")
-        except Exception as e:
-            print(f"Error sending AccountDataRequest: {e}")
 
     def get_market_price(self, symbol: str) -> float:
+        if not USE_OPENAPI:
+            return round(random.uniform(1.10, 1.20) + random.uniform(-0.005, 0.005), 5)
+
         if not self.is_connected:
-            raise RuntimeError("Cannot fetch market data when disconnected")
-        if not USE_QUICKFIX:
-            price = round(random.uniform(1.10, 1.20) + random.uniform(-0.005, 0.005), 5)
+            raise RuntimeError("Cannot fetch market data when disconnected from OpenAPI.")
+
+        # Price should be updated by the _listen_ws method from SpotEvents
+        # This method would just return the latest stored price
+        # For now, let's return a random price if not found in history,
+        # but ideally, it should come from self.last_price (which needs to be implemented)
+
+        # TODO: Implement self.last_price dictionary updated by spot events
+        # For now, using price_history if available, else random
+        if self.price_history:
+            # This is not symbol specific, needs improvement
+            return self.price_history[-1]
         else:
-            msg = fix.Message()
-            msg.getHeader().setField(fix.MsgType(fix.MsgType_MarketDataRequest))
-            msg.setField(fix.MDReqID("MD_" + symbol))
-            msg.setField(fix.SubscriptionRequestType(fix.SubscriptionRequestType_SNAPSHOT_PLUS_UPDATES))
-            msg.setField(fix.MarketDepth(1))
-            grp = fix.NoMDEntryTypes()
-            grp.setField(fix.MDEntryType(fix.MDEntryType_BID)); msg.addGroup(grp)
-            grp.setField(fix.MDEntryType(fix.MDEntryType_OFFER)); msg.addGroup(grp)
-            sym = fix.NoRelatedSym(); sym.setField(fix.Symbol(symbol)); msg.addGroup(sym)
-            for sid in fix.Session.getSessions():
-                fix.Session.sendToTarget(msg, sid)
-            time.sleep(0.5)
-            price = self.application.last_price.get(symbol, random.uniform(1.10, 1.20))
-        self.price_history.append(price)
-        if len(self.price_history) > self.history_size:
-            self.price_history.pop(0)
-        return price
+            # Before subscribing, we won't have prices.
+            # Consider sending a subscribe request here if not already subscribed.
+            # self.subscribe_to_symbol_openapi(symbol) # This should be async or queued
+            print(f"Market price for {symbol} not yet available from stream. Returning random.")
+            return round(random.uniform(1.10, 1.20) + random.uniform(-0.005, 0.005), 5)
+
+    # Placeholder for subscribe_to_symbol_openapi
+    async def subscribe_to_symbol_openapi(self, symbol_name: str):
+        # Needs mapping from symbol_name (e.g. "EUR/USD") to cTrader symbolId (long)
+        # This usually comes from a ProtoOASymbolsListRes or similar.
+        # Example assuming we have symbol_id:
+        # symbol_id_example = 1 # Replace with actual lookup
+        # subscribe_req = {
+        #    "payloadType": ABC, # ProtoOASubscribeSpotsReq
+        #    "payload": {
+        #        "ctidTraderAccountId": self.settings.openapi.default_account_id_str, # Or current active account
+        #        "symbolId": [symbol_id_example]
+        #    },
+        #    "clientMsgId": self._next_message_id()
+        # }
+        # if self.is_connected and self._ws_client:
+        #    await self._ws_client.send(json.dumps(subscribe_req))
+        print(f"Placeholder: subscribe_to_symbol_openapi({symbol_name}) called.")
+        pass
+
 
     def place_market_order(self, symbol: str, side: str, size: float, tp: float, sl: float):
-        if not self.is_connected:
-            raise RuntimeError("Not connected")
-        last_price = self.price_history[-1] if self.price_history else self.get_market_price(symbol)
-        if not USE_QUICKFIX:
-            print(f"[MOCK ORDER] {side.upper()} {symbol} size={size} TP={tp} SL={sl}")
+        if not USE_OPENAPI:
+            print(f"[MOCK ORDER OPENAPI] {side.upper()} {symbol} size={size} TP={tp} SL={sl}")
             return
-        order = fix.Message()
-        order.getHeader().setField(fix.MsgType(fix.MsgType_NewOrderSingle))
-        order.setField(fix.ClOrdID(f"ORD_{int(time.time()*1000)}"))
-        order.setField(fix.Symbol(symbol))
-        order.setField(fix.Side(fix.Side_BUY if side=='buy' else fix.Side_SELL))
-        order.setField(fix.OrdType(fix.OrdType_MARKET))
-        order.setField(fix.OrderQty(size))
-        order.setField(fix.StopPx(last_price - sl * 0.0001 if side=='buy' else last_price + sl * 0.0001))
-        order.setField(fix.TP(last_price + tp * 0.0001 if side=='buy' else last_price - tp * 0.0001))
-        for sid in fix.Session.getSessions():
-            fix.Session.sendToTarget(order, sid)
+
+        if not self.is_connected:
+            raise RuntimeError("Not connected to OpenAPI for placing order.")
+
+        # TODO: Implement sending ProtoOANewOrderReq
+        # This will require:
+        # - ctidTraderAccountId
+        # - symbolId (mapping from symbol string)
+        # - orderType (MARKET)
+        # - tradeSide (BUY/SELL)
+        # - volume (converted to cTrader format, e.g. lots * 100)
+        # - stopLoss, takeProfit (in absolute price or pips, as per API)
+        # - clientMsgId for tracking
+        print(f"Placeholder: place_market_order_openapi({symbol}, {side}, {size}) called.")
+        # Example structure (highly simplified):
+        # order_req = {
+        #    "payloadType": DEF, # ProtoOANewOrderReq
+        #    "payload": { ... details ... },
+        #    "clientMsgId": self._next_message_id()
+        # }
+        # Needs to be sent via an async task: asyncio.create_task(self._ws_client.send(json.dumps(order_req)))
+        pass
 
     def get_price_history(self) -> List[float]:
+        # This will be populated by the WebSocket listener from price updates
         return list(self.price_history)
 
-# QuickFIX application handler if available
-if USE_QUICKFIX:
-    class Application(fix.Application):
-        def __init__(self, trader: Trader):
-            super().__init__()
-            self.trader = trader
-            self.last_price = {}
-
-        def onCreate(self, sessionID):
-            print(f"Session created: {sessionID}")
-            pass
-
-        def onLogon(self, sessionID):
-            print(f"Logon: {sessionID}")
-            self.trader.is_connected = True
-            self.trader._last_error = ""
-            self.trader._logon_event.set() # Signal that logon has occurred
-            self.trader._logout_event.clear() # Ensure logout event is not set
-
-            # After successful logon, request account data
-            self.trader._send_account_data_request()
-
-        def onLogout(self, sessionID):
-            print(f"Logout: {sessionID}")
-            self.trader.is_connected = False
-            # You might want to set a specific error message or reason for logout
-            # For example, if the logout was unexpected.
-            if not self.trader._last_error: # Avoid overwriting a more specific error
-                self.trader._last_error = "Logged out"
-            self.trader._logon_event.clear() # Ensure logon event is not set
-            self.trader._logout_event.set() # Signal that logout has occurred
-
-        def toAdmin(self, message, sessionID):
-            # Log outgoing admin messages if desired
-            # print(f"ToAdmin: {message} (Session: {sessionID})")
-            pass
-
-        def toApp(self, message, sessionID):
-            # Log outgoing app messages if desired
-            # print(f"ToApp: {message} (Session: {sessionID})")
-            pass
-
-        def fromAdmin(self, message, sessionID):
-            # Handle administrative messages from the counterparty
-            # Example: Log Reject messages
-            msg_type_field = fix.MsgType()
-            message.getHeader().getField(msg_type_field)
-            msg_type = msg_type_field.getValue()
-
-            if msg_type == fix.MsgType_Reject: # Session-level Reject
-                text_field = fix.Text()
-                if message.isSetField(text_field.getField()):
-                    message.getField(text_field)
-                    reject_reason = text_field.getValue()
-                    print(f"Session Level Reject fromAdmin (Session: {sessionID}): {reject_reason}. Message: {message}")
-                    # Potentially update trader._last_error or take other actions
-                else:
-                    print(f"Session Level Reject fromAdmin (Session: {sessionID}): No text reason provided. Message: {message}")
-            # Handle other admin messages like Logout, Heartbeat etc. if needed
-            pass
-
-        def fromApp(self, message, sessionID):
-            msg_type = fix.MsgType(); message.getHeader().getField(msg_type)
-            msg_type_value = msg_type.getValue()
-
-            if msg_type_value == fix.MsgType_Reject: # Application-level Reject (e.g., for a business message)
-                text_field = fix.Text()
-                if message.isSetField(text_field.getField()):
-                    message.getField(text_field)
-                    reject_reason = text_field.getValue()
-                    print(f"Application Level Reject fromApp (Session: {sessionID}): {reject_reason}. Message: {message}")
-                    # Update trader._last_error or relevant order status
-                else:
-                    print(f"Application Level Reject fromApp (Session: {sessionID}): No text reason provided. Message: {message}")
-
-            elif msg_type_value == fix.MsgType_MarketDataSnapshotFullRefresh:
-                sym = fix.Symbol(); message.getField(sym)
-                px = fix.MDEntryPx(); message.getField(px)
-                self.trader.last_price[sym.getValue()] = px.getValue()
-
-            elif msg_type_value == fix.MsgType_ExecutionReport:
-                cl_ord_id = fix.ClOrdID()
-                exec_type = fix.ExecType()
-                ord_status = fix.OrdStatus()
-                text = fix.Text() # Optional text message
-
-                message.getField(cl_ord_id)
-                message.getField(exec_type)
-                message.getField(ord_status)
-
-                exec_type_str = exec_type.getValue()
-                ord_status_str = ord_status.getValue()
-
-                log_msg = f"ExecutionReport (Session: {sessionID}): ClOrdID={cl_ord_id.getValue()}, ExecType={exec_type_str}, OrdStatus={ord_status_str}"
-
-                if message.isSetField(text.getField()):
-                    message.getField(text)
-                    log_msg += f", Text='{text.getValue()}'"
-
-                print(log_msg)
-
-                # TODO: Further processing:
-                # - Map ClOrdID to internal order representation.
-                # - Update order status based on ExecType and OrdStatus.
-                # - Handle fills, partial fills, cancels, rejects.
-                # - Potentially update self.trader._last_error if it's a rejection of an order.
-
-            # Speculative: Handling AccountReport (custom message type 'UAS')
-            # This assumes cTrader sends a message like 'UAS' in response to 'UAR'.
-            # All tags used here are placeholders and need verification from cTrader's FIX spec.
-            elif msg_type_value == "UAS": # CUSTOM_TAG: Replace 'UAS' if different
-                print(f"Received AccountReport (UAS): {message}")
-                try:
-                    account_field = fix.Account() # Standard tag 1
-                    # Placeholder tags for balance, equity, margin, currency.
-                    # These are highly likely to be custom tags in the 5000+ or 9000+ range.
-                    # For example purposes, I'm inventing field objects.
-                    # These will cause AttributeErrors if not defined in the FIX dictionary.
-                    balance_field = fix.Balance() # Standard tag 900 (often for CashBalance in other contexts, may not be it)
-                                                # More likely custom e.g., fix.XBalance (tag 9001)
-                    equity_field = fix.NetChgPrevDay() # Placeholder: fix.XEquity (tag 9002) - No standard equity tag like this
-                    margin_field = fix.MarginRatio()   # Placeholder: fix.XMargin (tag 9003) - No standard margin tag like this
-                    currency_field = fix.Currency() # Standard tag 15
-
-                    if message.isSetField(account_field.getField()):
-                        message.getField(account_field)
-                        self.trader.account_id = account_field.getValue()
-                        print(f"  Account ID: {self.trader.account_id}")
-
-                    # --- IMPORTANT: The following field extractions are highly speculative ---
-                    # --- and will likely fail without the correct cTrader FIX Dictionary ---
-                    # --- and tag numbers. These are illustrative.                      ---
-
-                    # Example: Balance (assuming custom tag 9001 for XBalance)
-                    # Realistically, you'd use fix.StringField(9001) or similar if the tag is custom
-                    # and not pre-defined in the base quickfix python objects.
-                    # For now, to avoid immediate error IF the dictionary has 'Balance' but it's wrong:
-                    if hasattr(fix, 'XBalance') and message.isSetField(fix.XBalance().getField()): # CUSTOM_TAG: XBalance (e.g. 9001)
-                        message.getField(fix.XBalance()) # This line would be fix.XBalance()
-                        self.trader.balance = float(fix.XBalance().getValue()) # And here
-                        print(f"  Balance: {self.trader.balance}")
-                    elif message.isSetField(balance_field.getField()): # Fallback to trying standard Balance tag if XBalance not there
-                         message.getField(balance_field)
-                         try:
-                            self.trader.balance = float(balance_field.getValue())
-                            print(f"  Balance (using standard Balance tag): {self.trader.balance}")
-                         except ValueError:
-                            print(f"  Could not parse balance from standard Balance tag: {balance_field.getValue()}")
-
-
-                    if hasattr(fix, 'XEquity') and message.isSetField(fix.XEquity().getField()): # CUSTOM_TAG: XEquity (e.g. 9002)
-                        message.getField(fix.XEquity())
-                        self.trader.equity = float(fix.XEquity().getValue())
-                        print(f"  Equity: {self.trader.equity}")
-
-                    if hasattr(fix, 'XMargin') and message.isSetField(fix.XMargin().getField()): # CUSTOM_TAG: XMargin (e.g. 9003)
-                        message.getField(fix.XMargin())
-                        self.trader.margin = float(fix.XMargin().getValue())
-                        print(f"  Margin: {self.trader.margin}")
-
-                    if message.isSetField(currency_field.getField()):
-                        message.getField(currency_field)
-                        self.trader.currency = currency_field.getValue()
-                        print(f"  Currency: {self.trader.currency}")
-
-                    print("Trader account data updated.")
-
-                except AttributeError as e:
-                    print(f"Error processing AccountReport (UAS): Attribute not found (custom tag missing from dictionary?): {e}")
-                except Exception as e:
-                    print(f"Error processing AccountReport (UAS): {e}")
-            pass
+# Removed the old QuickFIX Application class entirely.

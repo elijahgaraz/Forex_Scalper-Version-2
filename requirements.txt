@@ -1,7 +1,7 @@
 # Requirements for the forex_scalper application
-#
-# The application currently only uses Python's standard library modules
-# (including tkinter for the GUI). No third-party packages are needed.
-#
-# FIX Engine library
-quickfix
+
+# For cTrader Open API (WebSocket and OAuth)
+websockets
+requests
+
+# tkinter for the GUI is part of the standard library.
