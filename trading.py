@@ -17,9 +17,11 @@ except ImportError:
 # Imports from spotware/OpenApiPy
 try:
     from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
-    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import * # Common enums like ProtoOAPayloadType
-    from ctrader_open_api.messages.OpenApiMessages_pb2 import * # Request/Response messages
-    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import * # Model messages
+    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import *
+    # Explicitly import potentially problematic names if wildcard doesn't catch them or for clarity
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetAccountListReq, ProtoOAGetAccountListRes
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *
     USE_OPENAPI_LIB = True
 except ImportError:
     print("ctrader-open-api library not found. Please install it. Running in mock mode.")
