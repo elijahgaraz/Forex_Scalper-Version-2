@@ -5,23 +5,24 @@ from typing import Optional
 
 @dataclass
 class OpenAPISettings:
-    # URLs for cTrader Open API
-    auth_url: str = ""  # e.g., "https://connect.spotware.com/apps/auth"
-    token_url: str = "" # e.g., "https://connect.spotware.com/apps/token"
-    api_ws_url: str = "" # e.g., "wss://demo.ctraderapi.com/" or "wss://live.ctraderapi.com/"
-
     # Credentials - preferentially loaded from environment variables
     client_id: Optional[str] = None
     client_secret: Optional[str] = None
 
-    # Optional: if you want to always trade with/monitor a specific account ID provided by cTrader API
-    # This is NOT the SenderCompID from FIX. This would be a cTrader account number.
-    default_account_id_str: Optional[str] = None # Store as string as API might provide it as such
+    # Connection type: "demo" or "live". This will be used with OpenApiPy's EndPoints.
+    host_type: str = "demo"
 
-    # Store tokens - these are typically not set in config.json but populated at runtime
-    access_token: Optional[str] = field(default=None, repr=False) # Don't show token in repr
-    refresh_token: Optional[str] = field(default=None, repr=False) # Don't show token in repr
-    token_expiry_time: Optional[float] = field(default=None, repr=False) # Store as timestamp
+    # Optional: cTrader Account ID (long integer, but often represented as string in configs)
+    # This is the ID of the trading account you want to authorize for trading operations.
+    # The library will likely require this for calls like GetTrader, SubscribeSpots etc.
+    # This is NOT the same as client_id (which is for the application).
+    default_ctid_trader_account_id: Optional[int] = None # Store as int if it's numeric
+
+    # The following may not be strictly needed if OpenApiPy handles auth internally via Proto messages
+    # and doesn't require a separate HTTP OAuth step for session tokens.
+    # Kept for now in case there's an initial setup step or alternative auth.
+    auth_url: Optional[str] = None # e.g., "https://connect.spotware.com/apps/auth" (Potentially Obsolete)
+    token_url: Optional[str] = None # e.g., "https://connect.spotware.com/apps/token" (Potentially Obsolete)
 
 
 @dataclass
@@ -64,12 +65,13 @@ class Settings:
             print("Warning: cTrader Client Secret not found in environment variables (CTRADER_CLIENT_SECRET) or config.json.")
 
         openapi_settings = OpenAPISettings(
-            auth_url=openapi_cfg.get("auth_url", "https://connect.spotware.com/apps/auth"), # Default example
-            token_url=openapi_cfg.get("token_url", "https://connect.spotware.com/apps/token"), # Default example
-            api_ws_url=openapi_cfg.get("api_ws_url", "wss://demo.ctraderapi.com/"), # Default example (DEMO)
             client_id=client_id,
             client_secret=client_secret,
-            default_account_id_str=openapi_cfg.get("default_account_id_str")
+            host_type=openapi_cfg.get("host_type", "demo").lower(), # Ensure lowercase "demo" or "live"
+            default_ctid_trader_account_id=openapi_cfg.get("default_ctid_trader_account_id"),
+            # Load potentially obsolete URLs, they will be None if not in config and no default given here
+            auth_url=openapi_cfg.get("auth_url"),
+            token_url=openapi_cfg.get("token_url")
         )
 
         general_settings = GeneralSettings(
@@ -82,27 +84,23 @@ class Settings:
     def save(self, path: str = "config.json") -> None:
         # Create a representation of settings that is safe to save (e.g., without tokens)
         # Only save configurable parts, not runtime state like access tokens.
-        openapi_to_save = {
-            "auth_url": self.openapi.auth_url,
-            "token_url": self.openapi.token_url,
-            "api_ws_url": self.openapi.api_ws_url,
-            # Only save client_id and client_secret if they were NOT from env vars
-            # and the user explicitly wants to save them (generally not recommended for secrets).
-            # For simplicity here, we'll save them if they exist, but warn about it.
+        openapi_data_to_save = {
             "client_id": self.openapi.client_id if not os.environ.get("CTRADER_CLIENT_ID") else None,
             "client_secret": self.openapi.client_secret if not os.environ.get("CTRADER_CLIENT_SECRET") else None,
-            "default_account_id_str": self.openapi.default_account_id_str,
+            "host_type": self.openapi.host_type,
+            "default_ctid_trader_account_id": self.openapi.default_ctid_trader_account_id,
+            "auth_url": self.openapi.auth_url, # Save if present, might be obsolete
+            "token_url": self.openapi.token_url, # Save if present, might be obsolete
         }
-        # Filter out None values from client_id/secret if they were from env, to avoid writing "null"
-        openapi_to_save = {k: v for k, v in openapi_to_save.items() if v is not None}
+        # Filter out None values to keep config clean, especially for secrets from env
+        openapi_data_to_save = {k: v for k, v in openapi_data_to_save.items() if v is not None}
 
-
-        if openapi_to_save.get("client_id") or openapi_to_save.get("client_secret"):
+        if openapi_data_to_save.get("client_id") or openapi_data_to_save.get("client_secret"):
             print(f"Warning: Saving Client ID or Client Secret to '{path}'. "
-                  "It's generally recommended to use environment variables for these.")
+                  "It's generally recommended to use environment variables for these secrets.")
 
         data_to_save = {
-            "openapi": openapi_to_save,
+            "openapi": openapi_data_to_save,
             "general": {
                 "default_symbol": self.general.default_symbol,
                 "chart_update_interval_ms": self.general.chart_update_interval_ms,
