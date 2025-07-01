@@ -17,11 +17,26 @@ except ImportError:
 # Imports from spotware/OpenApiPy
 try:
     from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
-    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
-    from ctrader_open_api.messages.OpenApiMessages_pb2 import *
-    # Explicitly import potentially problematic names if wildcard doesn't catch them or for clarity
-    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetAccountListReq, ProtoOAGetAccountListRes
-    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *
+    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import (
+        ProtoOAPayloadType, ProtoOAErrorCode, ProtoHeartbeatEvent,
+        ProtoOATraderUpdatedEvent, ProtoOASpotEvent, ProtoOAExecutionEvent, # Assuming these are common enough
+        ProtoOATradeSide # Enum for order placement
+        # Add other common enums if needed, e.g. ProtoOAOrderType
+    )
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAApplicationAuthReq, ProtoOAApplicationAuthRes,
+        ProtoOAAccountAuthReq, ProtoOAAccountAuthRes,
+        ProtoOAGetAccountListReq, ProtoOAGetAccountListRes,
+        ProtoOAGetTraderReq, ProtoOATraderRes,
+        ProtoOASubscribeSpotsReq, ProtoOASubscribeSpotsRes, # Assuming response exists
+        ProtoOANewOrderReq, # Assuming response is ProtoOAExecutionEvent
+        ProtoPingReq, ProtoPingRes,
+        ProtoOAErrorRes
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOATrader # Model used in ProtoOATraderRes
+        # Add other models if directly used, e.g. ProtoOAOrder, ProtoOAPosition
+    )
     USE_OPENAPI_LIB = True
 except ImportError:
     print("ctrader-open-api library not found. Please install it. Running in mock mode.")
